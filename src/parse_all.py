@@ -19,8 +19,27 @@ API_URL = "https://service.iiilab.com/api/web/extract"
 SECRET_KEY = "JSnHKQfP1IlzIQzs"
 SITE = "youtube"
 TEST_URL = "https://www.youtube.com/watch?v=ou3MCs79Lm0"
-PROXY_SOURCE = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all"
 MAX_PER_PROXY = 6
+
+# 免费 SOCKS5 代理源（raw text, 每行 ip:port）
+PROXY_SOURCES = [
+    # ProxyScrape API — 最大单源 (~2000 SOCKS5)
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
+    # TheSpeedX — 经典大列表 (~7000+)
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    # monosans — 每小时更新，带地理位置
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    # openproxylist — 每小时更新
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5.txt",
+    # hookzof/socks5_list — 自动更新
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/txt/socks5.txt",
+    # proxifly — 每5分钟更新
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5.txt",
+    # iplocate — 已验证, 30分钟更新
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/master/socks5.txt",
+    # Skillter/ProxyGather — 已验证 working only
+    "https://raw.githubusercontent.com/Skillter/ProxyGather/refs/heads/master/proxies/working-proxies-socks5.txt",
+]
 TZ = timezone(timedelta(hours=8))  # Asia/Shanghai
 
 
@@ -75,13 +94,24 @@ class ProxyPool:
 # ═══ Helpers ═════════════════════════════════════════════════
 
 def fetch_proxies():
-    """拉取 SOCKS5 代理列表。"""
-    try:
-        r = requests.get(PROXY_SOURCE, timeout=15)
-        return [f"socks5://{l.strip()}" for l in r.text.splitlines()
-                if l.strip() and ":" in l.strip()]
-    except Exception:
-        return []
+    """从多个免费源拉取 SOCKS5 代理列表。"""
+    all_proxies = set()
+    for src in PROXY_SOURCES:
+        try:
+            r = requests.get(src, timeout=15)
+            count = 0
+            for line in r.text.splitlines():
+                line = line.strip()
+                if line and ":" in line and not line.startswith("#"):
+                    all_proxies.add(f"socks5://{line}")
+                    count += 1
+            short = src.split("/")[-2] if "/" in src else src
+            print(f"  [源] {short}: +{count}")
+        except Exception as e:
+            print(f"  [源] {src[:50]}: FAIL ({e})")
+    result = list(all_proxies)
+    print(f"  [总计] {len(result)} 个候选 (去重后)")
+    return result
 
 
 def validate_proxies(candidates, target=20):
