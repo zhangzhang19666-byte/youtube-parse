@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 .env
-output/
 working_proxies.txt
 *.gs
 1.txt
