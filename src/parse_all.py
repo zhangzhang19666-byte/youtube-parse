@@ -1,7 +1,7 @@
 """GitHub Actions 入口 — 批量解析 YouTube 视频链接，输出 txt 文件。
 
 用法:
-  python src/parse_all.py --urls check.txt --proxy-target 20
+  python src/parse_all.py --urls check.txt --proxy-target 15
 """
 
 import hashlib
@@ -19,20 +19,15 @@ API_URL = "https://service.iiilab.com/api/web/extract"
 SECRET_KEY = "JSnHKQfP1IlzIQzs"
 SITE = "youtube"
 TEST_URL = "https://www.youtube.com/watch?v=ou3MCs79Lm0"
-MAX_PER_PROXY = 6
+MAX_PER_PROXY = 5
+TZ = timezone(timedelta(hours=8))  # Asia/Shanghai
 
-# 免费 SOCKS5 代理源（已验证有效，raw text, 每行 ip:port）
 PROXY_SOURCES = [
-    # ProxyScrape API — ~1200 SOCKS5
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
-    # TheSpeedX — ~4600 SOCKS5 (最大)
     "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-    # monosans — ~650, 每小时更新
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    # Skillter — ~160, 已验证 working only
     "https://raw.githubusercontent.com/Skillter/ProxyGather/refs/heads/master/proxies/working-proxies-socks5.txt",
 ]
-TZ = timezone(timedelta(hours=8))  # Asia/Shanghai
 
 
 # ═══ Proxy Pool ═══════════════════════════════════════════════
@@ -59,6 +54,7 @@ class ProxyPool:
         if not self._proxies:
             return None
         with self._lock:
+            # Try to find an under-capacity proxy
             for _ in range(len(self._proxies) * 2):
                 proxy = self._proxies[self._index % len(self._proxies)]
                 self._index += 1
@@ -86,7 +82,7 @@ class ProxyPool:
 # ═══ Helpers ═════════════════════════════════════════════════
 
 def fetch_proxies():
-    """从多个免费源拉取 SOCKS5 代理列表。"""
+    """从多个免费源拉取 SOCKS5 代理。"""
     all_proxies = set()
     for src in PROXY_SOURCES:
         try:
@@ -102,17 +98,19 @@ def fetch_proxies():
         except Exception as e:
             print(f"  [源] {src[:50]}: FAIL ({e})")
     result = list(all_proxies)
-    print(f"  [总计] {len(result)} 个候选 (去重后)")
+    print(f"  [总计] {len(result)} 个候选 (去重)")
     return result
 
 
 def validate_proxies(candidates, target=20):
-    """验证代理对 iiilab API 的可用性，返回可用的代理列表。"""
+    """快速验证代理对 iiilab API 的可用性 + 延迟。只保留 < 8s 的快代理。"""
     valid = []
     lock = threading.Lock()
     tested = [0]
+    t0 = time.perf_counter()
 
     def test(p):
+        t_start = time.perf_counter()
         ts = str(int(time.time()))
         sig = hashlib.md5((TEST_URL + SITE + ts + SECRET_KEY).encode()).hexdigest()
         try:
@@ -120,63 +118,78 @@ def validate_proxies(candidates, target=20):
                 json={"url": TEST_URL, "site": SITE},
                 headers={"Content-Type": "application/json", "G-Timestamp": ts, "G-Footer": sig,
                          "Origin": "https://youtube.iiilab.com", "Referer": "https://youtube.iiilab.com/"},
-                proxies={"http": p, "https": p}, timeout=10)
+                proxies={"http": p, "https": p}, timeout=12)
+            elapsed = time.perf_counter() - t_start
             with lock:
                 tested[0] += 1
-            if r.ok:
-                return (True, p)
-            elif "频繁" in r.json().get("message", ""):
-                return (True, p)
-            return (False, p)
+            if r.ok and elapsed < 8.0:
+                return (True, p, elapsed)
+            elif "频繁" in r.json().get("message", "") and elapsed < 8.0:
+                return (True, p, elapsed)  # proxy works, just rate-limited
+            return (False, p, elapsed)
         except Exception:
             with lock:
                 tested[0] += 1
-            return (False, p)
+            return (False, p, 99)
 
     t0 = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
         futures = [ex.submit(test, p) for p in candidates]
         for f in concurrent.futures.as_completed(futures):
-            ok, p = f.result()
+            ok, p, elapsed = f.result()
             if ok:
                 valid.append(p)
                 if len(valid) >= target:
                     ex.shutdown(wait=False, cancel_futures=True)
                     break
+            if tested[0] % 100 == 0:
+                dur = time.perf_counter() - t0
+                print(f"  [验证] {tested[0]:4d}/{len(candidates)}  有效:{len(valid)}  "
+
+                      f"{tested[0]/dur:.0f}/s")
+
+    dur = time.perf_counter() - t0
+    print(f"  [验证] 完成: {len(valid)} 个可用, 耗时 {dur:.0f}s ({tested[0]/dur:.0f}/s)")
     return valid
 
 
 def build_pool(pool, target=20):
-    """拉取并验证代理，构建代理池。"""
-    for attempt in range(3):
+    """拉取并验证代理，构建高质量代理池。"""
+    for attempt in range(2):
         if pool.alive >= target:
             break
-        print(f"[代理] 第{attempt+1}轮拉取...")
+        print(f"\n[代理] 第{attempt+1}轮拉取...")
         candidates = fetch_proxies()
         if not candidates:
             continue
-        valid = validate_proxies(candidates[:200], target - pool.alive)
+        # 每轮最多验证 300 个，避免浪费时间
+        sample = candidates[:300]
+        valid = validate_proxies(sample, target - pool.alive)
         pool.add(valid)
-    print(f"[代理] 池就绪: {pool.alive} 个可用")
+        print(f"[代理] 池: {pool.alive} 存活")
+    print(f"[代理] 最终池: {pool.alive} 个可用")
 
 
-def call_api(url, proxy=None, timeout=30):
-    """调用 iiilab API 解析单个视频。"""
+def call_api(url, proxy=None, timeout=25):
+    """调用 iiilab API（短超时，失败快速重试）。"""
     ts = str(int(time.time()))
     sig = hashlib.md5((url + SITE + ts + SECRET_KEY).encode()).hexdigest()
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
+    t0 = time.perf_counter()
     try:
         r = requests.post(API_URL,
             json={"url": url, "site": SITE},
             headers={"Content-Type": "application/json", "G-Timestamp": ts, "G-Footer": sig,
                      "Origin": "https://youtube.iiilab.com", "Referer": "https://youtube.iiilab.com/"},
             proxies=proxies, timeout=timeout)
+        lat = (time.perf_counter() - t0) * 1000
         if r.ok:
             data = r.json()
             title = data.get("text", "?")
             fmt_360 = None
-            for f in data.get("medias", [{}])[0].get("formats", []):
+            formats = data.get("medias", [{}])[0].get("formats", [])
+            for f in formats:
                 if f.get("quality") == 360 and f.get("separate") == 0:
                     fmt_360 = f
                     break
@@ -189,9 +202,12 @@ def call_api(url, proxy=None, timeout=30):
             }
         else:
             msg = r.json().get("message", r.text[:80])
-            return {"ok": False, "error": f"HTTP{r.status_code}: {msg}"}
+            return {"ok": False, "error": f"HTTP{r.status_code}: {msg}", "proxy_dead": False}
+    except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout):
+        return {"ok": False, "error": "PROXY_FAIL", "proxy_dead": True}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:80]}
+        return {"ok": False, "error": str(e)[:80], "proxy_dead": False}
 
 
 # ═══ Main ════════════════════════════════════════════════════
@@ -200,49 +216,60 @@ def main():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--urls", default="check.txt")
-    p.add_argument("--proxy-target", type=int, default=20)
-    p.add_argument("--workers", type=int, default=5)
+    p.add_argument("--proxy-target", type=int, default=15)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--max-retries", type=int, default=2)
     args = p.parse_args()
 
-    # Load URLs
     urls_path = args.urls
     if not os.path.isabs(urls_path):
         urls_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), urls_path)
     with open(urls_path, encoding="utf-8") as f:
         urls = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-    print(f"[开始] {len(urls)} 条 URL, 代理目标={args.proxy_target}")
+    print(f"[开始] {len(urls)} 条 URL  代理目标={args.proxy_target}  workers={args.workers}")
     print(f"[时间] {datetime.now(TZ):%Y-%m-%d %H:%M:%S}")
 
     # Build proxy pool
     pool = ProxyPool()
     build_pool(pool, target=args.proxy_target)
 
-    # Parse all URLs
-    results = []
+    # Parse with retry
+    results = [None] * len(urls)
     oks = 0
     fails = 0
     lock = threading.Lock()
     done = [0]
+    pending = list(range(len(urls)))
     t0 = time.perf_counter()
 
-    def worker(url):
-        proxy = pool.next()
-        info = call_api(url, proxy=proxy, timeout=40)
-        if not info["ok"] and "PROXY" in str(info.get("error", "")):
-            pool.mark_dead(proxy)
-        with lock:
-            done[0] += 1
-            print(f"  [{done[0]:3d}/{len(urls)}] "
-                  f"{'OK' if info['ok'] else 'FAIL'} "
-                  f"{info.get('title', info.get('error', '?'))[:50]}")
+    def process(idx):
+        url = urls[idx]
+        for attempt in range(args.max_retries + 1):
+            proxy = pool.next()
+            info = call_api(url, proxy=proxy, timeout=25)
+            if info["ok"]:
+                return info
+            if info.get("proxy_dead"):
+                pool.mark_dead(proxy)
+            # Retry with a different proxy
+            if attempt < args.max_retries and pool.alive > 0:
+                time.sleep(0.3)
+                continue
+            break
         return info
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(worker, url) for url in urls]
-        for f in concurrent.futures.as_completed(futures):
-            info = f.result()
-            results.append(info)
+        future_map = {ex.submit(process, i): i for i in range(len(urls))}
+        for future in concurrent.futures.as_completed(future_map):
+            idx = future_map[future]
+            info = future.result()
+            results[idx] = info
+            with lock:
+                done[0] += 1
+                ok_flag = "OK" if info["ok"] else "FAIL"
+                detail = info.get("title", info.get("error", "?"))[:45]
+                print(f"  [{done[0]:3d}/{len(urls)}] {ok_flag} {detail}")
             if info["ok"]:
                 oks += 1
             else:
@@ -256,20 +283,20 @@ def main():
     now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     timestamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
 
-    # youtube_urls.txt — 纯 URL
     url_lines = []
-    detail_lines = []
-    detail_lines.append(f"=== YouTube 视频解析结果 ===")
-    detail_lines.append(f"解析时间: {now_str}")
-    detail_lines.append(f"成功: {oks}  失败: {fails}  总计: {len(urls)}")
-    detail_lines.append("=" * 80)
+    detail_lines = [
+        f"=== YouTube 视频解析结果 ===",
+        f"解析时间: {now_str}",
+        f"成功: {oks}  失败: {fails}  总计: {len(urls)}",
+        "=" * 80,
+    ]
 
     for i, r in enumerate(results):
         detail_lines.append("")
         if r["ok"]:
-            mins, secs = divmod(r["duration"], 60)
+            m, s = divmod(r["duration"], 60)
             detail_lines.append(f"[{i+1}] {r['title']}")
-            detail_lines.append(f"    时长: {mins}分{secs}秒  |  360p: {r['size_mb']}MB")
+            detail_lines.append(f"    时长: {m}分{s}秒  |  360p: {r['size_mb']}MB")
             if r.get("url_360p"):
                 detail_lines.append(f"    下载: {r['url_360p']}")
                 url_lines.append(r["url_360p"])
@@ -285,27 +312,17 @@ def main():
     url_content = "\n".join(url_lines)
     detail_content = "\n".join(detail_lines)
 
-    # 带时间戳的文件（保留历史）
-    url_file_ts = f"output/youtube_urls_{timestamp}.txt"
-    detail_file_ts = f"output/youtube_detail_{timestamp}.txt"
-
-    # latest 文件（供 workflow commit）
-    url_file_latest = "output/youtube_urls_latest.txt"
-    detail_file_latest = "output/youtube_detail_latest.txt"
-
     for path, content in [
-        (url_file_ts, url_content),
-        (url_file_latest, url_content),
-        (detail_file_ts, detail_content),
-        (detail_file_latest, detail_content),
+        (f"output/youtube_urls_{timestamp}.txt", url_content),
+        ("output/youtube_urls_latest.txt", url_content),
+        (f"output/youtube_detail_{timestamp}.txt", detail_content),
+        ("output/youtube_detail_latest.txt", detail_content),
     ]:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    print(f"[输出] {url_file_ts}  ({len(url_lines)} 条)")
-    print(f"[输出] {detail_file_ts}  ({len(detail_lines)} 行)")
-    print(f"[输出] {url_file_latest}")
-    print(f"[输出] {detail_file_latest}")
+    print(f"[输出] {len(url_lines)} 条 URL")
+    print(f"[输出] {len(detail_lines)} 行详情")
 
 
 if __name__ == "__main__":
