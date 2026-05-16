@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+output/
+working_proxies.txt
+*.gs
+1.txt
+page.html
+probe_log.txt
+probe_recovered.txt
+PROJECT_SUMMARY.md
+.idea/
+.vscode/

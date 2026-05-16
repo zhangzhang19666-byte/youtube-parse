@@ -1,0 +1,51 @@
+name: YouTube 视频解析
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls_file:
+        description: 'URL 列表文件 (仓库内路径)'
+        default: 'check.txt'
+        required: true
+      proxy_target:
+        description: '代理池目标数量'
+        default: '20'
+        required: false
+  schedule:
+    # 每天 UTC 16:00 (北京时间 00:00) 自动运行
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install requests[socks]
+
+      - name: 解析视频
+        run: |
+          python src/parse_all.py \
+            --urls "${{ github.event.inputs.urls_file || 'check.txt' }}" \
+            --proxy-target "${{ github.event.inputs.proxy_target || '20' }}"
+
+      - name: 提交结果到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --staged --quiet || git commit -m "📺 解析结果 $(date +%Y-%m-%d_%H:%M) [skip ci]"
+          git push
